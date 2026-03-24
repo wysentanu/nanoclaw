@@ -28,13 +28,17 @@ import {
 } from './container-runtime.js';
 import {
   getAllChats,
+  getAllGlobalFacts,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getUserMemories,
+  getTopicMemories,
   initDatabase,
+  pruneExpiredTopicMemories,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -44,7 +48,13 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatMessagesWithMemories,
+  formatOutbound,
+} from './router.js';
+import { extractAndStoreMemories } from './memory-extractor.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -143,6 +153,18 @@ export function _setRegisteredGroups(
   registeredGroups = groups;
 }
 
+function getLastNonBotSender(messages: NewMessage[]): string {
+  return [...messages].reverse().find((m) => !m.is_from_me)?.sender ?? '';
+}
+
+function buildMemoryContext(senderJid: string, groupFolder: string) {
+  return {
+    userMemories: senderJid ? getUserMemories(senderJid) : [],
+    topicMemories: getTopicMemories(groupFolder),
+    globalFacts: getAllGlobalFacts(),
+  };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -179,7 +201,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  // Identify triggering sender (last non-bot message in the batch)
+  const triggeringSender = getLastNonBotSender(missedMessages);
+  const memoryCtx = buildMemoryContext(triggeringSender, group.folder);
+
+  const prompt = formatMessagesWithMemories(missedMessages, TIMEZONE, memoryCtx);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -210,6 +236,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  let fullAgentResponse = '';
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -222,6 +249,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
+        fullAgentResponse += (fullAgentResponse ? '\n' : '') + text;
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
@@ -231,6 +259,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
+      // Trigger async memory extraction after each completed agent turn
+      if (fullAgentResponse && triggeringSender) {
+        extractAndStoreMemories({
+          senderJid: triggeringSender,
+          groupFolder: group.folder,
+          conversationText: prompt + '\n\nAssistant:\n' + fullAgentResponse,
+        });
+        fullAgentResponse = '';
+      }
     }
 
     if (result.status === 'error') {
@@ -417,7 +454,12 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
+          const pipeSender = getLastNonBotSender(messagesToSend);
+          const formatted = formatMessagesWithMemories(
+            messagesToSend,
+            TIMEZONE,
+            buildMemoryContext(pipeSender, group.folder),
+          );
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
@@ -474,6 +516,9 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+  // Prune expired topic memories daily
+  pruneExpiredTopicMemories();
+  setInterval(() => pruneExpiredTopicMemories(), 24 * 60 * 60 * 1000);
   restoreRemoteControl();
 
   // Start credential proxy (containers route API calls through this)

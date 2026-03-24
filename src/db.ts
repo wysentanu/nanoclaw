@@ -82,6 +82,30 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS user_memories (
+      sender_jid TEXT NOT NULL,
+      key        TEXT NOT NULL,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (sender_jid, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_memories (
+      topic        TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      content      TEXT NOT NULL,
+      updated_at   TEXT NOT NULL,
+      expires_at   TEXT NOT NULL,
+      PRIMARY KEY (topic, group_folder)
+    );
+    CREATE INDEX IF NOT EXISTS idx_topic_expires ON topic_memories(expires_at);
+
+    CREATE TABLE IF NOT EXISTS global_facts (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -632,6 +656,90 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Memory tier accessors ---
+
+export interface UserMemory {
+  sender_jid: string;
+  key: string;
+  value: string;
+  updated_at: string;
+}
+
+export function getUserMemories(senderJid: string): UserMemory[] {
+  return db
+    .prepare('SELECT * FROM user_memories WHERE sender_jid = ? ORDER BY key')
+    .all(senderJid) as UserMemory[];
+}
+
+export function upsertUserMemory(
+  senderJid: string,
+  key: string,
+  value: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO user_memories (sender_jid, key, value, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(sender_jid, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(senderJid, key, value, now);
+}
+
+export interface TopicMemory {
+  topic: string;
+  group_folder: string;
+  content: string;
+  updated_at: string;
+  expires_at: string;
+}
+
+const TOPIC_MEMORY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function getTopicMemories(groupFolder: string): TopicMemory[] {
+  const now = new Date().toISOString();
+  return db
+    .prepare(
+      `SELECT * FROM topic_memories WHERE group_folder = ? AND expires_at > ? ORDER BY updated_at DESC LIMIT 50`,
+    )
+    .all(groupFolder, now) as TopicMemory[];
+}
+
+export function upsertTopicMemory(
+  topic: string,
+  groupFolder: string,
+  content: string,
+): void {
+  const now = new Date().toISOString();
+  const expires = new Date(Date.now() + TOPIC_MEMORY_TTL_MS).toISOString();
+  db.prepare(
+    `INSERT INTO topic_memories (topic, group_folder, content, updated_at, expires_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(topic, group_folder) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at, expires_at = excluded.expires_at`,
+  ).run(topic, groupFolder, content, now, expires);
+}
+
+export function pruneExpiredTopicMemories(): void {
+  const now = new Date().toISOString();
+  db.prepare('DELETE FROM topic_memories WHERE expires_at <= ?').run(now);
+}
+
+export interface GlobalFact {
+  key: string;
+  value: string;
+  updated_at: string;
+}
+
+export function getAllGlobalFacts(): GlobalFact[] {
+  return db
+    .prepare('SELECT * FROM global_facts ORDER BY key LIMIT 100')
+    .all() as GlobalFact[];
+}
+
+export function upsertGlobalFact(key: string, value: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO global_facts (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(key, value, now);
 }
 
 // --- JSON migration ---

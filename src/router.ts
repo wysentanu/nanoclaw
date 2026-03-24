@@ -1,3 +1,4 @@
+import { GlobalFact, TopicMemory, UserMemory } from './db.js';
 import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
 
@@ -22,6 +23,49 @@ export function formatMessages(
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;
 
   return `${header}<messages>\n${lines.join('\n')}\n</messages>`;
+}
+
+export interface MemoryContext {
+  userMemories: UserMemory[];
+  topicMemories: TopicMemory[];
+  globalFacts: GlobalFact[];
+}
+
+export function formatMessagesWithMemories(
+  messages: NewMessage[],
+  timezone: string,
+  memory: MemoryContext,
+): string {
+  const parts: string[] = [];
+
+  if (memory.globalFacts.length > 0) {
+    const entries = memory.globalFacts
+      .map((f) => `  <fact key="${escapeXml(f.key)}">${escapeXml(f.value)}</fact>`)
+      .join('\n');
+    parts.push(`<global_facts>\n${entries}\n</global_facts>`);
+  }
+
+  if (memory.userMemories.length > 0) {
+    const entries = memory.userMemories
+      .map((m) => `  <fact key="${escapeXml(m.key)}">${escapeXml(m.value)}</fact>`)
+      .join('\n');
+    parts.push(`<user_profile>\n${entries}\n</user_profile>`);
+  }
+
+  if (memory.topicMemories.length > 0) {
+    const entries = memory.topicMemories
+      .map(
+        (m) =>
+          `  <topic name="${escapeXml(m.topic)}" updated="${escapeXml(m.updated_at)}">${escapeXml(m.content)}</topic>`,
+      )
+      .join('\n');
+    parts.push(`<topic_cache>\n${entries}\n</topic_cache>`);
+  }
+
+  const memoryBlock =
+    parts.length > 0 ? `<memory>\n${parts.join('\n')}\n</memory>\n` : '';
+
+  return memoryBlock + formatMessages(messages, timezone);
 }
 
 export function stripInternalTags(text: string): string {
