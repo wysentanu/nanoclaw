@@ -186,11 +186,16 @@ function buildMemoryContext(senderJid: string, groupFolder: string) {
  * Returns a stop function that clears the indicator and the interval.
  */
 function keepTyping(channel: Channel, chatJid: string): () => void {
-  logger.info({ chatJid, hasSetTyping: !!channel.setTyping }, 'keepTyping: starting');
+  logger.info(
+    { chatJid, hasSetTyping: !!channel.setTyping },
+    'keepTyping: starting',
+  );
   try {
-    channel.setTyping?.(chatJid, true)?.catch((err) =>
-      logger.warn({ chatJid, err }, 'keepTyping: setTyping failed'),
-    );
+    channel
+      .setTyping?.(chatJid, true)
+      ?.catch((err) =>
+        logger.warn({ chatJid, err }, 'keepTyping: setTyping failed'),
+      );
   } catch (err) {
     logger.warn({ chatJid, err }, 'keepTyping: setTyping threw');
   }
@@ -308,15 +313,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     let fullDaemonResponse = '';
     runAgent(group, prompt, chatJid, triggeringSender, async (result) => {
       if (result.result) {
-        const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        logger.info({ group: group.name }, `Daemon agent output: ${raw.length} chars`);
+        logger.info(
+          { group: group.name },
+          `Daemon agent output: ${raw.length} chars`,
+        );
         if (text) {
           fullDaemonResponse += (fullDaemonResponse ? '\n' : '') + text;
           await channel.sendMessage(chatJid, text);
         }
       }
-      if (result.status === 'success' && fullDaemonResponse && triggeringSender) {
+      if (
+        result.status === 'success' &&
+        fullDaemonResponse &&
+        triggeringSender
+      ) {
         extractAndStoreMemories({
           senderJid: triggeringSender,
           groupFolder: daemonGroup.folder,
@@ -324,15 +339,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         });
         fullDaemonResponse = '';
       }
-    }).then((status) => {
-      stopTyping();
-      if (status === 'error') {
-        logger.warn({ group: group.name }, 'Daemon agent error (cursor already advanced)');
-      }
-    }).catch((err) => {
-      logger.error({ group: group.name, err }, 'Daemon dispatch error');
-      stopTyping();
-    });
+    })
+      .then((status) => {
+        stopTyping();
+        if (status === 'error') {
+          logger.warn(
+            { group: group.name },
+            'Daemon agent error (cursor already advanced)',
+          );
+        }
+      })
+      .catch((err) => {
+        logger.error({ group: group.name, err }, 'Daemon dispatch error');
+        stopTyping();
+      });
 
     return true; // Release queue slot immediately
   }
@@ -343,38 +363,44 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let outputSentToUser = false;
   let fullAgentResponse = '';
 
-  const output = await runAgent(group, prompt, chatJid, triggeringSender, async (result) => {
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        fullAgentResponse += (fullAgentResponse ? '\n' : '') + text;
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    triggeringSender,
+    async (result) => {
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          fullAgentResponse += (fullAgentResponse ? '\n' : '') + text;
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        resetIdleTimer();
       }
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-      if (fullAgentResponse && triggeringSender) {
-        extractAndStoreMemories({
-          senderJid: triggeringSender,
-          groupFolder: group.folder,
-          conversationText: prompt + '\n\nAssistant:\n' + fullAgentResponse,
-        });
-        fullAgentResponse = '';
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+        if (fullAgentResponse && triggeringSender) {
+          extractAndStoreMemories({
+            senderJid: triggeringSender,
+            groupFolder: group.folder,
+            conversationText: prompt + '\n\nAssistant:\n' + fullAgentResponse,
+          });
+          fullAgentResponse = '';
+        }
       }
-    }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+  );
 
   stopTyping();
   if (idleTimer) clearTimeout(idleTimer);
@@ -413,19 +439,30 @@ function ensureDaemon(group: RegisteredGroup, chatJid: string): boolean {
   // Throttle restart: wait 10s after last exit before restarting
   const lastRestart = daemonRestartAt.get(chatJid) ?? 0;
   if (Date.now() - lastRestart < 10_000) {
-    logger.warn({ group: group.name }, 'Daemon container recently exited, throttling restart');
+    logger.warn(
+      { group: group.name },
+      'Daemon container recently exited, throttling restart',
+    );
     return false;
   }
 
   daemonRestartAt.set(chatJid, Date.now());
 
-  const daemon = startDaemonContainer(group, chatJid, ASSISTANT_NAME, (code) => {
-    daemonContainers.delete(chatJid);
-    logger.warn({ group: group.name, code }, 'Daemon container stopped');
-  });
+  const daemon = startDaemonContainer(
+    group,
+    chatJid,
+    ASSISTANT_NAME,
+    (code) => {
+      daemonContainers.delete(chatJid);
+      logger.warn({ group: group.name, code }, 'Daemon container stopped');
+    },
+  );
 
   daemonContainers.set(chatJid, daemon);
-  logger.info({ group: group.name, container: daemon.name }, 'Daemon container started');
+  logger.info(
+    { group: group.name, container: daemon.name },
+    'Daemon container started',
+  );
   return true;
 }
 
@@ -731,7 +768,11 @@ async function main(): Promise<void> {
     // Stop daemon containers
     for (const [jid, daemon] of daemonContainers) {
       logger.info({ jid, container: daemon.name }, 'Stopping daemon container');
-      try { daemon.proc.kill('SIGTERM'); } catch { /* ignore */ }
+      try {
+        daemon.proc.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
     }
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();

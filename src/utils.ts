@@ -13,6 +13,10 @@ export function writeFileAtomic(filePath: string, content: string): void {
 /**
  * Pad a number to a fixed width with leading zeros or custom character.
  */
-export function padNumber(num: number, width: number = 6, pad: string = '0'): string {
+export function padNumber(
+  num: number,
+  width: number = 6,
+  pad: string = '0',
+): string {
   return num.toString().padStart(width, pad);
 }

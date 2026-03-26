@@ -305,7 +305,9 @@ export async function runContainerAgent(
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
-  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+  const safeName = group.folder
+    .replace(/[^a-zA-Z0-9-]/g, '-')
+    .replace(/^-+|-+$/g, '');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
 
@@ -760,7 +762,10 @@ export function startDaemonContainer(
   const containerName = `nanoclaw-daemon-${safeName}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
 
-  logger.info({ group: group.name, containerName, isMain }, 'Starting daemon container');
+  logger.info(
+    { group: group.name, containerName, isMain },
+    'Starting daemon container',
+  );
 
   const proc = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -782,7 +787,10 @@ export function startDaemonContainer(
     // Log any unexpected stdout for debugging.
     const text = data.toString().trim();
     if (text) {
-      logger.debug({ container: group.folder, daemon: true }, `daemon stdout: ${text.slice(0, 200)}`);
+      logger.debug(
+        { container: group.folder, daemon: true },
+        `daemon stdout: ${text.slice(0, 200)}`,
+      );
     }
   });
 
@@ -795,12 +803,18 @@ export function startDaemonContainer(
   });
 
   proc.on('close', (code) => {
-    logger.info({ group: group.name, containerName, code }, 'Daemon container exited');
+    logger.info(
+      { group: group.name, containerName, code },
+      'Daemon container exited',
+    );
     onExit(code);
   });
 
   proc.on('error', (err) => {
-    logger.error({ group: group.name, containerName, err }, 'Daemon container spawn error');
+    logger.error(
+      { group: group.name, containerName, err },
+      'Daemon container spawn error',
+    );
     onExit(-1);
   });
 
@@ -834,15 +848,22 @@ export async function watchDaemonUserOutput(
   timeoutMs: number,
 ): Promise<void> {
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
-  const outDir = path.join(groupIpcDir, 'users', senderJid, 'output', requestId);
+  const outDir = path.join(
+    groupIpcDir,
+    'users',
+    senderJid,
+    'output',
+    requestId,
+  );
 
   const deadline = Date.now() + timeoutMs;
   let nextSeq = 0;
 
   while (Date.now() < deadline) {
     if (fs.existsSync(outDir)) {
-      const files = fs.readdirSync(outDir)
-        .filter(f => f.endsWith('.json') && !f.endsWith('.tmp'))
+      const files = fs
+        .readdirSync(outDir)
+        .filter((f) => f.endsWith('.json') && !f.endsWith('.tmp'))
         .sort();
 
       for (const file of files) {
@@ -863,17 +884,28 @@ export async function watchDaemonUserOutput(
 
         // Done marker: result: null with success or any error
         if (output.result === null) {
-          try { fs.rmdirSync(outDir); } catch { /* may have remaining files */ }
+          try {
+            fs.rmdirSync(outDir);
+          } catch {
+            /* may have remaining files */
+          }
           return;
         }
       }
     }
 
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 300));
   }
 
-  logger.warn({ groupFolder, senderJid, requestId }, 'Daemon user output watch timed out');
-  await onOutput({ status: 'error', result: null, error: 'Daemon response timeout' });
+  logger.warn(
+    { groupFolder, senderJid, requestId },
+    'Daemon user output watch timed out',
+  );
+  await onOutput({
+    status: 'error',
+    result: null,
+    error: 'Daemon response timeout',
+  });
 }
 
 /**

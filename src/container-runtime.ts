@@ -27,8 +27,7 @@ export const CONTAINER_HOST_GATEWAY =
  * Linux (bare-metal): 127.0.0.1 — containers use --network host and reach loopback directly.
  * macOS/WSL: 127.0.0.1 — Docker Desktop routes host.docker.internal to host loopback.
  */
-export const PROXY_BIND_HOST =
-  process.env.CREDENTIAL_PROXY_HOST || '127.0.0.1';
+export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST || '127.0.0.1';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
