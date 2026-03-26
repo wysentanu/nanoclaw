@@ -96,7 +96,6 @@ const daemonRestartAt = new Map<string, number>();
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
-
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -456,7 +455,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
  * Starts one if not running or if previous one exited. Returns false if start is
  * throttled (recent crash).
  */
-async function ensureDaemon(group: RegisteredGroup, chatJid: string): Promise<boolean> {
+async function ensureDaemon(
+  group: RegisteredGroup,
+  chatJid: string,
+): Promise<boolean> {
   if (daemonContainers.has(chatJid)) return true;
 
   // Throttle restart: wait 10s after last exit before restarting

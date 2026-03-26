@@ -6,6 +6,7 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   WASocket,
+  downloadMediaMessage,
   fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
@@ -15,9 +16,14 @@ import makeWASocket, {
 import {
   ASSISTANT_HAS_OWN_NUMBER,
   ASSISTANT_NAME,
+  CONTAINER_WORK_PATH,
   STORE_DIR,
+  WORK_DIR,
 } from '../config.js';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
+
+const REJECTED_MIMETYPE_PREFIXES = ['image/', 'video/', 'audio/'];
+const createdSenderDirs = new Set<string>();
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -206,6 +212,59 @@ export class WhatsAppChannel implements Channel {
           // Only deliver full message for registered groups
           const groups = this.opts.registeredGroups();
           if (groups[chatJid]) {
+            const sender = msg.key.participant || msg.key.remoteJid || '';
+            const senderName = msg.pushName || sender.split('@')[0];
+            const fromMe = msg.key.fromMe || false;
+
+            const doc = normalized.documentMessage;
+            if (doc) {
+              const mimetype = doc.mimetype || '';
+
+              if (
+                REJECTED_MIMETYPE_PREFIXES.some((p) => mimetype.startsWith(p))
+              ) {
+                await this.sock.sendMessage(chatJid, {
+                  text: `Sorry, I don't support ${mimetype.split('/')[0]} files. Please send a document (PDF, Word, Excel, CSV, etc.).`,
+                });
+                continue;
+              }
+
+              const senderId = sender.split('@')[0];
+              const senderWorkDir = path.join(WORK_DIR, senderId);
+              if (!createdSenderDirs.has(senderWorkDir)) {
+                fs.mkdirSync(senderWorkDir, { recursive: true });
+                createdSenderDirs.add(senderWorkDir);
+              }
+
+              const originalName = doc.fileName || 'document';
+              const safeName = path
+                .basename(originalName)
+                .replace(/[^a-zA-Z0-9._-]/g, '_');
+              const destPath = path.join(senderWorkDir, safeName);
+
+              const buffer = await downloadMediaMessage(msg, 'buffer', {});
+              await fs.promises.writeFile(destPath, buffer as Buffer);
+              logger.info({ destPath, mimetype }, 'Document saved');
+
+              const caption = doc.caption?.trim() || '';
+              const fileNote = `[File received: ${CONTAINER_WORK_PATH}/${senderId}/${safeName}]`;
+              const content = caption ? `${caption}\n${fileNote}` : fileNote;
+
+              this.opts.onMessage(chatJid, {
+                id: msg.key.id || '',
+                chat_jid: chatJid,
+                sender,
+                sender_name: senderName,
+                content,
+                timestamp,
+                is_from_me: fromMe,
+                is_bot_message: ASSISTANT_HAS_OWN_NUMBER
+                  ? fromMe
+                  : content.startsWith(`${ASSISTANT_NAME}:`),
+              });
+              continue;
+            }
+
             const content =
               normalized.conversation ||
               normalized.extendedTextMessage?.text ||
@@ -216,10 +275,6 @@ export class WhatsAppChannel implements Channel {
             // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
             if (!content) continue;
 
-            const sender = msg.key.participant || msg.key.remoteJid || '';
-            const senderName = msg.pushName || sender.split('@')[0];
-
-            const fromMe = msg.key.fromMe || false;
             // Detect bot messages: with own number, fromMe is reliable
             // since only the bot sends from that number.
             // With shared number, bot messages carry the assistant name prefix

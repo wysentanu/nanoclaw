@@ -10,11 +10,13 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
+  CONTAINER_WORK_PATH,
   CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
+  WORK_DIR,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -235,6 +237,15 @@ function buildVolumeMounts(
     hostPath: groupAgentRunnerDir,
     containerPath: '/app/src',
     readonly: false,
+  });
+
+  // ~/work — shared upload directory. Mounted read-only so agents can read
+  // files dropped by channels but cannot modify them.
+  fs.mkdirSync(WORK_DIR, { recursive: true });
+  mounts.push({
+    hostPath: WORK_DIR,
+    containerPath: CONTAINER_WORK_PATH,
+    readonly: true,
   });
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)

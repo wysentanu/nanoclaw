@@ -29,7 +29,6 @@ export const CONTAINER_HOST_GATEWAY =
  */
 export const PROXY_BIND_HOST = process.env.CREDENTIAL_PROXY_HOST || '127.0.0.1';
 
-
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
   // Bare-metal Linux: use host networking so containers share the host's loopback
