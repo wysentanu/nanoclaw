@@ -11,41 +11,36 @@ import { logger } from './logger.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
-/** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+/**
+ * Hostname containers use to reach the host machine.
+ * Linux: 127.0.0.1 — containers run with --network host and share loopback.
+ * macOS/WSL: host.docker.internal — routed through Docker Desktop VM.
+ */
+export const CONTAINER_HOST_GATEWAY =
+  os.platform() === 'linux' &&
+  !fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')
+    ? '127.0.0.1'
+    : 'host.docker.internal';
 
 /**
  * Address the credential proxy binds to.
- * Docker Desktop (macOS): 127.0.0.1 — the VM routes host.docker.internal to loopback.
- * Docker (Linux): bind to the docker0 bridge IP so only containers can reach it,
- *   falling back to 0.0.0.0 if the interface isn't found.
+ * Linux (bare-metal): 127.0.0.1 — containers use --network host and reach loopback directly.
+ * macOS/WSL: 127.0.0.1 — Docker Desktop routes host.docker.internal to host loopback.
  */
 export const PROXY_BIND_HOST =
-  process.env.CREDENTIAL_PROXY_HOST || detectProxyBindHost();
-
-function detectProxyBindHost(): string {
-  if (os.platform() === 'darwin') return '127.0.0.1';
-
-  // WSL uses Docker Desktop (same VM routing as macOS) — loopback is correct.
-  // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
-  if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
-
-  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
-  const ifaces = os.networkInterfaces();
-  const docker0 = ifaces['docker0'];
-  if (docker0) {
-    const ipv4 = docker0.find((a) => a.family === 'IPv4');
-    if (ipv4) return ipv4.address;
-  }
-  return '0.0.0.0';
-}
+  process.env.CREDENTIAL_PROXY_HOST || '127.0.0.1';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
-  if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
+  // Bare-metal Linux: use host networking so containers share the host's loopback
+  // and can reach the credential proxy at 127.0.0.1 without iptables rules.
+  if (
+    os.platform() === 'linux' &&
+    !fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')
+  ) {
+    return ['--network', 'host'];
   }
+  // macOS/WSL: Docker Desktop provides host.docker.internal automatically.
   return [];
 }
 

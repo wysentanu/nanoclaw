@@ -111,7 +111,10 @@ export class WhatsAppChannel implements Channel {
 
         if (shouldReconnect) {
           logger.info('Reconnecting...');
-          this.connectInternal().catch((err) => {
+          // Pass onFirstOpen through so connect() resolves even after early reconnects
+          const pendingOpen = onFirstOpen;
+          onFirstOpen = undefined;
+          this.connectInternal(pendingOpen).catch((err) => {
             logger.error({ err }, 'Failed to reconnect, retrying in 5s');
             setTimeout(() => {
               this.connectInternal().catch((err2) => {

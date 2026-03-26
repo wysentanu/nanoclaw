@@ -73,6 +73,12 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      group_folder TEXT NOT NULL,
+      sender_jid TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      PRIMARY KEY (group_folder, sender_jid)
+    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -557,6 +563,45 @@ export function getAllSessions(): Record<string, string> {
   const result: Record<string, string> = {};
   for (const row of rows) {
     result[row.group_folder] = row.session_id;
+  }
+  return result;
+}
+
+// --- Per-user session accessors ---
+
+export function getUserSession(
+  groupFolder: string,
+  senderJid: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      'SELECT session_id FROM user_sessions WHERE group_folder = ? AND sender_jid = ?',
+    )
+    .get(groupFolder, senderJid) as { session_id: string } | undefined;
+  return row?.session_id;
+}
+
+export function setUserSession(
+  groupFolder: string,
+  senderJid: string,
+  sessionId: string,
+): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO user_sessions (group_folder, sender_jid, session_id) VALUES (?, ?, ?)',
+  ).run(groupFolder, senderJid, sessionId);
+}
+
+export function getAllUserSessions(): Record<string, string> {
+  const rows = db
+    .prepare('SELECT group_folder, sender_jid, session_id FROM user_sessions')
+    .all() as Array<{
+    group_folder: string;
+    sender_jid: string;
+    session_id: string;
+  }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[`${row.group_folder}:${row.sender_jid}`] = row.session_id;
   }
   return result;
 }

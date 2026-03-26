@@ -40,14 +40,18 @@ export function formatMessagesWithMemories(
 
   if (memory.globalFacts.length > 0) {
     const entries = memory.globalFacts
-      .map((f) => `  <fact key="${escapeXml(f.key)}">${escapeXml(f.value)}</fact>`)
+      .map(
+        (f) => `  <fact key="${escapeXml(f.key)}">${escapeXml(f.value)}</fact>`,
+      )
       .join('\n');
     parts.push(`<global_facts>\n${entries}\n</global_facts>`);
   }
 
   if (memory.userMemories.length > 0) {
     const entries = memory.userMemories
-      .map((m) => `  <fact key="${escapeXml(m.key)}">${escapeXml(m.value)}</fact>`)
+      .map(
+        (m) => `  <fact key="${escapeXml(m.key)}">${escapeXml(m.value)}</fact>`,
+      )
       .join('\n');
     parts.push(`<user_profile>\n${entries}\n</user_profile>`);
   }

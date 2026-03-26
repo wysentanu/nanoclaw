@@ -28,6 +28,7 @@ import {
 import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { writeFileAtomic } from './utils.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -146,6 +147,33 @@ function buildVolumeMounts(
     );
   }
 
+  // Write a synthetic credentials file so Claude Code uses the stored-token flow
+  // (Authorization: Bearer <token> on inference requests) instead of the
+  // OAuth key-exchange flow (which requires org:create_api_key scope).
+  // The credential proxy intercepts every request and replaces "placeholder"
+  // with the real token, so containers never see actual credentials.
+  const credentialsFile = path.join(groupSessionsDir, '.credentials.json');
+  if (!fs.existsSync(credentialsFile)) {
+    fs.writeFileSync(
+      credentialsFile,
+      JSON.stringify(
+        {
+          claudeAiOauth: {
+            accessToken: 'placeholder',
+            refreshToken: 'placeholder',
+            // Far-future expiry: credential proxy handles all auth, never needs refresh
+            expiresAt: 9999999999999,
+            scopes: ['user:inference'],
+            subscriptionType: 'pro',
+            rateLimitTier: 'default_claude_ai',
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  }
+
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
@@ -229,13 +257,14 @@ function buildContainerArgs(
 
   // Mirror the host's auth method with a placeholder value.
   // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
+  // OAuth mode:   .credentials.json (written by buildVolumeMounts) has "placeholder"
+  //               as the access token; Claude Code sends Authorization: Bearer placeholder
+  //               on inference requests; proxy replaces with real OAuth token.
+  //               No CLAUDE_CODE_OAUTH_TOKEN env needed — that triggers key-exchange
+  //               which requires org:create_api_key scope (not available on claude.ai tokens).
   const authMode = detectAuthMode();
   if (authMode === 'api-key') {
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
-  } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
   // Runtime-specific args for host gateway resolution
@@ -276,7 +305,7 @@ export async function runContainerAgent(
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
-  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-').replace(/^-+|-+$/g, '');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
 
@@ -683,6 +712,168 @@ export interface AvailableGroup {
   name: string;
   lastActivity: string;
   isRegistered: boolean;
+}
+
+// --- Daemon container support ---
+
+export interface DaemonInput {
+  mode: 'daemon';
+  groupFolder: string;
+  chatJid: string;
+  isMain: boolean;
+  assistantName?: string;
+}
+
+export interface DaemonUserMessage {
+  type: 'message';
+  text: string;
+  sessionId?: string;
+  chatJid: string;
+  requestId: string;
+  senderJid: string;
+}
+
+export interface DaemonContainer {
+  name: string;
+  proc: ChildProcess;
+  groupFolder: string;
+}
+
+/**
+ * Start a persistent daemon container for a group.
+ * The container runs until killed; onExit is called when it exits.
+ */
+export function startDaemonContainer(
+  group: RegisteredGroup,
+  chatJid: string,
+  assistantName: string,
+  onExit: (code: number | null) => void,
+): DaemonContainer {
+  const isMain = group.isMain === true;
+  const mounts = buildVolumeMounts(group, isMain);
+
+  // Ensure users IPC dir exists on host before container starts
+  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  fs.mkdirSync(path.join(groupIpcDir, 'users'), { recursive: true });
+
+  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const containerName = `nanoclaw-daemon-${safeName}`;
+  const containerArgs = buildContainerArgs(mounts, containerName);
+
+  logger.info({ group: group.name, containerName, isMain }, 'Starting daemon container');
+
+  const proc = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  const daemonInput: DaemonInput = {
+    mode: 'daemon',
+    groupFolder: group.folder,
+    chatJid,
+    isMain,
+    assistantName,
+  };
+
+  proc.stdin.write(JSON.stringify(daemonInput));
+  proc.stdin.end();
+
+  proc.stdout.on('data', (data) => {
+    // Daemon containers write results to IPC files, not stdout.
+    // Log any unexpected stdout for debugging.
+    const text = data.toString().trim();
+    if (text) {
+      logger.debug({ container: group.folder, daemon: true }, `daemon stdout: ${text.slice(0, 200)}`);
+    }
+  });
+
+  proc.stderr.on('data', (data) => {
+    const chunk = data.toString();
+    const lines = chunk.trim().split('\n');
+    for (const line of lines) {
+      if (line) logger.debug({ container: group.folder, daemon: true }, line);
+    }
+  });
+
+  proc.on('close', (code) => {
+    logger.info({ group: group.name, containerName, code }, 'Daemon container exited');
+    onExit(code);
+  });
+
+  proc.on('error', (err) => {
+    logger.error({ group: group.name, containerName, err }, 'Daemon container spawn error');
+    onExit(-1);
+  });
+
+  return { name: containerName, proc, groupFolder: group.folder };
+}
+
+/**
+ * Write a user message to the daemon's per-user input directory.
+ */
+export function sendDaemonUserMessage(
+  groupFolder: string,
+  senderJid: string,
+  msg: DaemonUserMessage,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  const inputDir = path.join(groupIpcDir, 'users', senderJid, 'input');
+  fs.mkdirSync(inputDir, { recursive: true });
+  const filePath = path.join(inputDir, `${msg.requestId}.json`);
+  writeFileAtomic(filePath, JSON.stringify(msg));
+}
+
+/**
+ * Poll the daemon's per-user output directory for results.
+ * Calls onOutput for each result file; resolves when done marker received or timeout.
+ */
+export async function watchDaemonUserOutput(
+  groupFolder: string,
+  senderJid: string,
+  requestId: string,
+  onOutput: (output: ContainerOutput) => Promise<void>,
+  timeoutMs: number,
+): Promise<void> {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  const outDir = path.join(groupIpcDir, 'users', senderJid, 'output', requestId);
+
+  const deadline = Date.now() + timeoutMs;
+  let nextSeq = 0;
+
+  while (Date.now() < deadline) {
+    if (fs.existsSync(outDir)) {
+      const files = fs.readdirSync(outDir)
+        .filter(f => f.endsWith('.json') && !f.endsWith('.tmp'))
+        .sort();
+
+      for (const file of files) {
+        const expectedSeq = nextSeq.toString().padStart(6, '0');
+        if (!file.startsWith(expectedSeq)) continue; // Wait for sequential files
+
+        const filePath = path.join(outDir, file);
+        let output: ContainerOutput;
+        try {
+          output = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+          fs.unlinkSync(filePath);
+          nextSeq++;
+        } catch {
+          break; // File may be mid-write; retry next poll
+        }
+
+        await onOutput(output);
+
+        // Done marker: result: null with success or any error
+        if (output.result === null) {
+          try { fs.rmdirSync(outDir); } catch { /* may have remaining files */ }
+          return;
+        }
+      }
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+
+  logger.warn({ groupFolder, senderJid, requestId }, 'Daemon user output watch timed out');
+  await onOutput({ status: 'error', result: null, error: 'Daemon response timeout' });
 }
 
 /**

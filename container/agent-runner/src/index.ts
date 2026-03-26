@@ -2,22 +2,28 @@
  * NanoClaw Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout
  *
- * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
- *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
- *          Files: {type:"message", text:"..."}.json — polled and consumed
- *          Sentinel: /workspace/ipc/input/_close — signals session end
+ * Single-shot mode (default):
+ *   Stdin: Full ContainerInput JSON (read until EOF)
+ *   IPC:   Follow-up messages at /workspace/ipc/input/ ; _close sentinel exits loop
+ *   Output: Stdout markers (OUTPUT_START/END)
  *
- * Stdout protocol:
- *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
- *   Final marker after loop ends signals completion.
+ * Daemon mode:
+ *   Stdin: GroupConfig JSON with mode: 'daemon'
+ *   IPC:   Per-user dirs at /workspace/ipc/users/<senderJid>/input/ and output/
+ *   Output: Per-user result files (no stdout markers)
  */
 
 import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+
+// Utility for atomic file writes (shared pattern across container/host)
+function writeFileAtomic(filePath: string, content: string): void {
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, content);
+  fs.renameSync(tempPath, filePath);
+}
 
 interface ContainerInput {
   prompt: string;
@@ -34,6 +40,30 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+}
+
+interface GroupConfig {
+  mode: 'daemon';
+  groupFolder: string;
+  chatJid: string;
+  isMain: boolean;
+  assistantName?: string;
+}
+
+interface UserMessageFile {
+  type: 'message';
+  text: string;
+  sessionId?: string;
+  chatJid: string;
+  requestId: string;
+  senderJid: string;
+}
+
+interface UserState {
+  stream: MessageStream | null;
+  sessionId: string | undefined;
+  busy: boolean;
+  lastAssistantUuid: string | undefined;
 }
 
 interface SessionEntry {
@@ -57,6 +87,7 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const USERS_IPC_BASE = '/workspace/ipc/users';
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -111,6 +142,14 @@ function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
   console.log(OUTPUT_END_MARKER);
+}
+
+function writeUserOutput(senderJid: string, requestId: string, seq: number, output: ContainerOutput): void {
+  const outDir = path.join(USERS_IPC_BASE, senderJid, 'output', requestId);
+  fs.mkdirSync(outDir, { recursive: true });
+  const seqStr = seq.toString().padStart(6, '0');
+  const finalPath = path.join(outDir, `${seqStr}.json`);
+  writeFileAtomic(finalPath, JSON.stringify(output));
 }
 
 function log(message: string): void {
@@ -270,35 +309,45 @@ function shouldClose(): boolean {
 }
 
 /**
+ * Generic drain function for JSON message files in a directory.
+ * Reads, parses, deletes files, and returns results of type T.
+ */
+function drainJsonFiles<T extends { type: string }>(
+  dir: string,
+  logPrefix: string,
+): T[] {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const files = fs.readdirSync(dir).filter(f => f.endsWith('.json')).sort();
+
+    const results: T[] = [];
+    for (const file of files) {
+      const filePath = path.join(dir, file);
+      try {
+        const data: T = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        fs.unlinkSync(filePath);
+        if (data.type === 'message') {
+          results.push(data);
+        }
+      } catch (err) {
+        log(`Failed to process ${logPrefix} file ${file}: ${err instanceof Error ? err.message : String(err)}`);
+        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    }
+    return results;
+  } catch (err) {
+    log(`Drain error (${logPrefix}): ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+}
+
+/**
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
  */
 function drainIpcInput(): string[] {
-  try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
-      .sort();
-
-    const messages: string[] = [];
-    for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
-      try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          messages.push(data.text);
-        }
-      } catch (err) {
-        log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-      }
-    }
-    return messages;
-  } catch (err) {
-    log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
-  }
+  const files = drainJsonFiles<{ type: string; text: string }>(IPC_INPUT_DIR, 'IPC');
+  return files.map(f => f.text);
 }
 
 /**
@@ -324,10 +373,21 @@ function waitForIpcMessage(): Promise<string | null> {
 }
 
 /**
- * Run a single query and stream results via writeOutput.
+ * Drain messages from a user-specific input directory.
+ */
+function drainUserInput(senderJid: string): UserMessageFile[] {
+  const inputDir = path.join(USERS_IPC_BASE, senderJid, 'input');
+  if (!fs.existsSync(inputDir)) return [];
+  return drainJsonFiles<UserMessageFile>(inputDir, `user/${senderJid}`);
+}
+
+/**
+ * Run a single query and stream results via writeOutput or custom emitter.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
  * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
+ *
+ * In single-shot mode (no opts.stream): creates stream, polls IPC, checks _close.
+ * In daemon mode (opts.stream provided): uses external stream, skips IPC polling.
  */
 async function runQuery(
   prompt: string,
@@ -336,30 +396,42 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
+  opts?: {
+    stream?: MessageStream;
+    onResult?: (output: ContainerOutput) => void;
+  },
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const stream = new MessageStream();
-  stream.push(prompt);
+  const managedStream = !opts?.stream;
+  const stream = opts?.stream ?? new MessageStream();
+  const emitResult = opts?.onResult ?? writeOutput;
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
-  let ipcPolling = true;
+  if (managedStream) {
+    stream.push(prompt);
+  }
+
+  // Poll IPC for follow-up messages and _close sentinel during the query (single-shot only)
+  let ipcPolling = managedStream;
   let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
-    }
+
+  if (managedStream) {
+    const pollIpcDuringQuery = () => {
+      if (!ipcPolling) return;
+      if (shouldClose()) {
+        log('Close sentinel detected during query, ending stream');
+        closedDuringQuery = true;
+        stream.end();
+        ipcPolling = false;
+        return;
+      }
+      const messages = drainIpcInput();
+      for (const text of messages) {
+        log(`Piping IPC message into active query (${text.length} chars)`);
+        stream.push(text);
+      }
+      setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+    };
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-  };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+  }
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
@@ -451,7 +523,7 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
+      emitResult({
         status: 'success',
         result: textResult || null,
         newSessionId
@@ -464,14 +536,155 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
+/**
+ * Run a single user's query session inside the daemon.
+ * Manages per-user stream and writes results to user output dir.
+ */
+async function runUserSession(
+  senderJid: string,
+  requestId: string,
+  firstMsg: UserMessageFile,
+  state: UserState,
+  config: GroupConfig,
+  mcpServerPath: string,
+  sdkEnv: Record<string, string | undefined>,
+): Promise<void> {
+  state.busy = true;
+  const stream = new MessageStream();
+  state.stream = stream;
+  stream.push(firstMsg.text);
+  // End the stream immediately so the SDK subprocess receives EOF and starts
+  // processing. Each user message is its own query; follow-ups that arrive
+  // while this query is running will be picked up by the daemon loop after
+  // this session completes (state.busy = false).
+  stream.end();
+  state.stream = null; // No longer pipeable — each query is self-contained
+
+  let seq = 0;
+
+  const containerInput: ContainerInput = {
+    prompt: firstMsg.text,
+    sessionId: state.sessionId,
+    groupFolder: config.groupFolder,
+    chatJid: firstMsg.chatJid || config.chatJid,
+    isMain: config.isMain,
+    assistantName: config.assistantName,
+  };
+
+  const onResult = (output: ContainerOutput) => {
+    writeUserOutput(senderJid, requestId, seq++, output);
+    if (output.newSessionId) {
+      state.sessionId = output.newSessionId;
+    }
+  };
+
+  try {
+    log(`[daemon] Starting query for ${senderJid} (request: ${requestId}, session: ${state.sessionId || 'new'})`);
+
+    const result = await runQuery(
+      firstMsg.text,
+      state.sessionId,
+      mcpServerPath,
+      containerInput,
+      sdkEnv,
+      state.lastAssistantUuid,
+      { stream, onResult },
+    );
+
+    if (result.newSessionId) state.sessionId = result.newSessionId;
+    if (result.lastAssistantUuid) state.lastAssistantUuid = result.lastAssistantUuid;
+
+    // Write done marker
+    writeUserOutput(senderJid, requestId, seq++, {
+      status: 'success',
+      result: null,
+      newSessionId: state.sessionId,
+    });
+
+    log(`[daemon] Query complete for ${senderJid} (request: ${requestId})`);
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    log(`[daemon] Query error for ${senderJid}: ${errorMessage}`);
+    writeUserOutput(senderJid, requestId, seq++, {
+      status: 'error',
+      result: null,
+      error: errorMessage,
+    });
+  } finally {
+    state.stream = null;
+    state.busy = false;
+  }
+}
+
+/**
+ * Daemon mode: persistent container handling multiple users concurrently.
+ * Polls /workspace/ipc/users/ for new messages from any user.
+ */
+async function runDaemon(
+  config: GroupConfig,
+  mcpServerPath: string,
+  sdkEnv: Record<string, string | undefined>,
+): Promise<void> {
+  const userStates = new Map<string, UserState>();
+
+  log(`Daemon started for group: ${config.groupFolder}`);
+  fs.mkdirSync(USERS_IPC_BASE, { recursive: true });
+
+  while (true) {
+    try {
+      if (fs.existsSync(USERS_IPC_BASE)) {
+        const entries = fs.readdirSync(USERS_IPC_BASE);
+
+        for (const senderJid of entries) {
+          const userDir = path.join(USERS_IPC_BASE, senderJid);
+          if (!fs.statSync(userDir).isDirectory()) continue;
+
+          const msgs = drainUserInput(senderJid);
+
+          for (const msg of msgs) {
+            let state = userStates.get(senderJid);
+            if (!state) {
+              state = {
+                stream: null,
+                sessionId: msg.sessionId,
+                busy: false,
+                lastAssistantUuid: undefined,
+              };
+              userStates.set(senderJid, state);
+            } else if (msg.sessionId && !state.sessionId) {
+              state.sessionId = msg.sessionId;
+            }
+
+            if (!state.busy) {
+              // Start a new query for this user
+              runUserSession(senderJid, msg.requestId, msg, state, config, mcpServerPath, sdkEnv)
+                .catch(err =>
+                  log(`[daemon] Unhandled session error for ${senderJid}: ${err instanceof Error ? err.message : String(err)}`)
+                );
+            } else {
+              // User is busy — re-queue message to input dir; daemon will process it after current query ends
+              log(`[daemon] User ${senderJid} busy, re-queuing message ${msg.requestId}`);
+              const retryPath = path.join(USERS_IPC_BASE, senderJid, 'input', `${msg.requestId}.json`);
+              try { fs.writeFileSync(retryPath, JSON.stringify(msg)); } catch { /* ignore */ }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      log(`[daemon] Poll error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, IPC_POLL_MS));
+  }
+}
+
 async function main(): Promise<void> {
-  let containerInput: ContainerInput;
+  let rawInput: ContainerInput | GroupConfig;
 
   try {
     const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
+    rawInput = JSON.parse(stdinData);
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -481,12 +694,22 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-  // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
+
+  // Dispatch to daemon or single-shot mode based on input
+  if ('mode' in rawInput && rawInput.mode === 'daemon') {
+    const config = rawInput as GroupConfig;
+    log(`Received daemon config for group: ${config.groupFolder}`);
+    await runDaemon(config, mcpServerPath, sdkEnv);
+    return;
+  }
+
+  // Single-shot mode (original behavior)
+  const containerInput = rawInput as ContainerInput;
+  log(`Received input for group: ${containerInput.groupFolder}`);
 
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });

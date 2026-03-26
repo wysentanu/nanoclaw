@@ -3,6 +3,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -17,7 +18,11 @@ import {
 } from './channels/registry.js';
 import {
   ContainerOutput,
+  DaemonContainer,
   runContainerAgent,
+  sendDaemonUserMessage,
+  startDaemonContainer,
+  watchDaemonUserOutput,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -32,6 +37,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getAllUserSessions,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -42,6 +48,7 @@ import {
   setRegisteredGroup,
   setRouterState,
   setSession,
+  setUserSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
@@ -75,9 +82,15 @@ export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
+let userSessions: Record<string, string> = {}; // keyed "${groupFolder}:${senderJid}"
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+// Persistent daemon containers: one per group JID
+const daemonContainers = new Map<string, DaemonContainer>();
+// Track daemon container restarts to avoid immediate re-start loops
+const daemonRestartAt = new Map<string, number>();
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -92,6 +105,7 @@ function loadState(): void {
     lastAgentTimestamp = {};
   }
   sessions = getAllSessions();
+  userSessions = getAllUserSessions();
   registeredGroups = getAllRegisteredGroups();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
@@ -166,6 +180,39 @@ function buildMemoryContext(senderJid: string, groupFolder: string) {
 }
 
 /**
+ * Send typing indicator and keep refreshing it every 20 s until the returned
+ * cancel function is called. WhatsApp expires the indicator after ~25 s, so
+ * without refreshing the user sees silence during long agent runs.
+ * Returns a stop function that clears the indicator and the interval.
+ */
+function keepTyping(channel: Channel, chatJid: string): () => void {
+  logger.info({ chatJid, hasSetTyping: !!channel.setTyping }, 'keepTyping: starting');
+  try {
+    channel.setTyping?.(chatJid, true)?.catch((err) =>
+      logger.warn({ chatJid, err }, 'keepTyping: setTyping failed'),
+    );
+  } catch (err) {
+    logger.warn({ chatJid, err }, 'keepTyping: setTyping threw');
+  }
+  const interval = setInterval(async () => {
+    logger.info({ chatJid }, 'keepTyping: refreshing');
+    try {
+      // WhatsApp won't reset the 25s timer if already in composing state.
+      // Force a paused→composing transition to restart the clock.
+      await channel.setTyping?.(chatJid, false);
+      await channel.setTyping?.(chatJid, true);
+    } catch (err) {
+      logger.warn({ chatJid, err }, 'keepTyping: refresh threw');
+    }
+  }, 10_000);
+  return () => {
+    clearInterval(interval);
+    logger.info({ chatJid }, 'keepTyping: stopped');
+    channel.setTyping?.(chatJid, false)?.catch(() => {});
+  };
+}
+
+/**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
@@ -205,7 +252,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const triggeringSender = getLastNonBotSender(missedMessages);
   const memoryCtx = buildMemoryContext(triggeringSender, group.folder);
 
-  const prompt = formatMessagesWithMemories(missedMessages, TIMEZONE, memoryCtx);
+  const prompt = formatMessagesWithMemories(
+    missedMessages,
+    TIMEZONE,
+    memoryCtx,
+  );
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -233,19 +284,71 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  // Daemon mode: dispatch to background and release queue slot immediately.
+  // The daemon handles concurrent users internally; holding the slot would
+  // prevent other groups from running while one user waits for a response.
+  if (triggeringSender) {
+    const stopTyping = keepTyping(channel, chatJid);
+
+    // Route to main group's daemon — all users share one container and global context
+    const mainEntry = getMainGroup();
+    const daemonGroup = mainEntry?.[1] ?? group;
+    const daemonJid = mainEntry?.[0] ?? chatJid;
+
+    // Ensure daemon is running (starts it if needed)
+    if (!ensureDaemon(daemonGroup, daemonJid)) {
+      // Throttled — roll back and retry
+      stopTyping();
+      lastAgentTimestamp[chatJid] = previousCursor;
+      saveState();
+      return false;
+    }
+
+    // Fire-and-forget: dispatch to daemon, release queue slot immediately
+    let fullDaemonResponse = '';
+    runAgent(group, prompt, chatJid, triggeringSender, async (result) => {
+      if (result.result) {
+        const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Daemon agent output: ${raw.length} chars`);
+        if (text) {
+          fullDaemonResponse += (fullDaemonResponse ? '\n' : '') + text;
+          await channel.sendMessage(chatJid, text);
+        }
+      }
+      if (result.status === 'success' && fullDaemonResponse && triggeringSender) {
+        extractAndStoreMemories({
+          senderJid: triggeringSender,
+          groupFolder: daemonGroup.folder,
+          conversationText: prompt + '\n\nAssistant:\n' + fullDaemonResponse,
+        });
+        fullDaemonResponse = '';
+      }
+    }).then((status) => {
+      stopTyping();
+      if (status === 'error') {
+        logger.warn({ group: group.name }, 'Daemon agent error (cursor already advanced)');
+      }
+    }).catch((err) => {
+      logger.error({ group: group.name, err }, 'Daemon dispatch error');
+      stopTyping();
+    });
+
+    return true; // Release queue slot immediately
+  }
+
+  // Single-shot path: scheduled tasks and messages without a senderJid
+  const stopTyping = keepTyping(channel, chatJid);
   let hadError = false;
   let outputSentToUser = false;
   let fullAgentResponse = '';
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
+  const output = await runAgent(group, prompt, chatJid, triggeringSender, async (result) => {
     if (result.result) {
       const raw =
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
@@ -253,13 +356,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
     }
 
     if (result.status === 'success') {
       queue.notifyIdle(chatJid);
-      // Trigger async memory extraction after each completed agent turn
       if (fullAgentResponse && triggeringSender) {
         extractAndStoreMemories({
           senderJid: triggeringSender,
@@ -275,7 +376,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
+  stopTyping();
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -301,14 +402,62 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * Ensure a daemon container is running for the group.
+ * Starts one if not running or if previous one exited. Returns false if start is
+ * throttled (recent crash).
+ */
+function ensureDaemon(group: RegisteredGroup, chatJid: string): boolean {
+  if (daemonContainers.has(chatJid)) return true;
+
+  // Throttle restart: wait 10s after last exit before restarting
+  const lastRestart = daemonRestartAt.get(chatJid) ?? 0;
+  if (Date.now() - lastRestart < 10_000) {
+    logger.warn({ group: group.name }, 'Daemon container recently exited, throttling restart');
+    return false;
+  }
+
+  daemonRestartAt.set(chatJid, Date.now());
+
+  const daemon = startDaemonContainer(group, chatJid, ASSISTANT_NAME, (code) => {
+    daemonContainers.delete(chatJid);
+    logger.warn({ group: group.name, code }, 'Daemon container stopped');
+  });
+
+  daemonContainers.set(chatJid, daemon);
+  logger.info({ group: group.name, container: daemon.name }, 'Daemon container started');
+  return true;
+}
+
+/**
+ * Returns the main group entry [jid, group], or undefined if none registered.
+ */
+function getMainGroup(): [string, RegisteredGroup] | undefined {
+  return Object.entries(registeredGroups).find(([, g]) => g.isMain === true) as
+    | [string, RegisteredGroup]
+    | undefined;
+}
+
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  senderJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
-  const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  // All user messages route to the main group's daemon — single shared container,
+  // global context, per-user sessions keyed by senderJid.
+  const mainEntry = senderJid ? getMainGroup() : undefined;
+  const daemonGroup = mainEntry?.[1] ?? group;
+  const daemonJid = mainEntry?.[0] ?? chatJid;
+
+  const isMain = daemonGroup.isMain === true;
+  const sessionKey = senderJid
+    ? `${daemonGroup.folder}:${senderJid}`
+    : daemonGroup.folder;
+  const sessionId = senderJid
+    ? userSessions[sessionKey]
+    : sessions[daemonGroup.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -335,12 +484,61 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  const saveSession = (newSessionId: string) => {
+    if (senderJid) {
+      userSessions[sessionKey] = newSessionId;
+      setUserSession(daemonGroup.folder, senderJid, newSessionId);
+    } else {
+      sessions[daemonGroup.folder] = newSessionId;
+      setSession(daemonGroup.folder, newSessionId);
+    }
+  };
+
+  // User messages → daemon IPC path (persistent container, per-user sessions)
+  // Scheduled tasks → single-shot container path (isolated, no daemon needed)
+  if (senderJid) {
+    if (!ensureDaemon(daemonGroup, daemonJid)) {
+      return 'error';
+    }
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+    sendDaemonUserMessage(daemonGroup.folder, senderJid, {
+      type: 'message',
+      text: prompt,
+      sessionId,
+      chatJid,
+      requestId,
+      senderJid,
+    });
+
+    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+
+    try {
+      await watchDaemonUserOutput(
+        daemonGroup.folder,
+        senderJid,
+        requestId,
+        async (output) => {
+          if (output.newSessionId) {
+            saveSession(output.newSessionId);
+          }
+          if (onOutput) await onOutput(output);
+        },
+        configTimeout,
+      );
+      return 'success';
+    } catch (err) {
+      logger.error({ group: group.name, err }, 'Daemon agent error');
+      return 'error';
+    }
+  }
+
+  // Single-shot path: scheduled tasks and fallback
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          saveSession(output.newSessionId);
         }
         await onOutput(output);
       }
@@ -363,8 +561,7 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      saveSession(output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -531,6 +728,11 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    // Stop daemon containers
+    for (const [jid, daemon] of daemonContainers) {
+      logger.info({ jid, container: daemon.name }, 'Stopping daemon container');
+      try { daemon.proc.kill('SIGTERM'); } catch { /* ignore */ }
+    }
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);

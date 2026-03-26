@@ -1,10 +1,6 @@
 import { request as httpsRequest } from 'https';
 
-import {
-  upsertGlobalFact,
-  upsertTopicMemory,
-  upsertUserMemory,
-} from './db.js';
+import { upsertGlobalFact, upsertTopicMemory, upsertUserMemory } from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
@@ -42,9 +38,15 @@ let cachedApiKey: string | undefined;
 
 function getApiKey(): string {
   if (!cachedApiKey) {
-    const secrets = readEnvFile(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
+    const secrets = readEnvFile([
+      'ANTHROPIC_API_KEY',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+    ]);
     cachedApiKey = secrets.ANTHROPIC_API_KEY || secrets.CLAUDE_CODE_OAUTH_TOKEN;
-    if (!cachedApiKey) throw new Error('No API key found (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)');
+    if (!cachedApiKey)
+      throw new Error(
+        'No API key found (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)',
+      );
   }
   return cachedApiKey;
 }
@@ -81,9 +83,13 @@ async function callHaiku(conversationText: string): Promise<ExtractedMemories> {
               content?: Array<{ text?: string }>;
               error?: { message: string };
             };
-            if (json.error) throw new Error(`Haiku API error: ${json.error.message}`);
+            if (json.error)
+              throw new Error(`Haiku API error: ${json.error.message}`);
             const raw = json?.content?.[0]?.text ?? '{}';
-            const text = raw.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+            const text = raw
+              .replace(/^```json\s*/i, '')
+              .replace(/\s*```$/, '')
+              .trim();
             resolve(JSON.parse(text) as ExtractedMemories);
           } catch (err) {
             reject(err);
@@ -131,11 +137,20 @@ export function extractAndStoreMemories(ctx: MemoryExtractionContext): void {
       }
 
       logger.debug(
-        { sender: ctx.senderJid, group: ctx.groupFolder, userCount, topicCount, globalCount },
+        {
+          sender: ctx.senderJid,
+          group: ctx.groupFolder,
+          userCount,
+          topicCount,
+          globalCount,
+        },
         'Memory extraction complete',
       );
     } catch (err) {
-      logger.warn({ err, sender: ctx.senderJid }, 'Memory extraction failed (non-fatal)');
+      logger.warn(
+        { err, sender: ctx.senderJid },
+        'Memory extraction failed (non-fatal)',
+      );
     }
   })();
 }
